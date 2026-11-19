@@ -45,7 +45,7 @@ final class Coordinator {
         guard connected else { return "等待 RustDesk 远控连入中" }
         let who = currentLabel ?? "RustDesk 远控"
         if let c = display.current, display.isActive {
-            let mode = store.config.shouldSetAsMain ? "主屏" : "扩展屏"
+            let mode = (store.config.shouldSetAsMain || display.physicalOff) ? "主屏" : "扩展屏"
             return "\(who) 已连接 · 虚拟屏 \(c.sizeLabel)（\(mode)）\(display.physicalOff ? " · 物理屏已关闭" : "")"
         }
         return "\(who) 已连接 · 未启用虚拟屏"

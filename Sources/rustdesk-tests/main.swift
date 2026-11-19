@@ -114,8 +114,14 @@ struct RustDeskTestsRunner {
         precondition(state.update(activeSessions: [s2], cmProcessActive: true, now: t0.addingTimeInterval(1.2)) == .peerChanged)
         precondition(state.currentPeerIP == "198.51.100.11")
 
-        // 超过防抖时间（1.6s > 1.5s）触发断开
-        precondition(state.update(activeSessions: [], cmProcessActive: false, now: t0.addingTimeInterval(3.0)) == .disconnected)
+        // 即使距离上次活跃回调已超过防抖时长，首次检测到断开时仍须重新起算防抖，不可立即断开
+        precondition(state.update(activeSessions: [], cmProcessActive: false, now: t0.addingTimeInterval(5.0)) == nil)
+        precondition(state.connected)
+        precondition(state.update(activeSessions: [], cmProcessActive: false, now: t0.addingTimeInterval(6.0)) == nil)
+        precondition(state.connected)
+
+        // 自首次观察到断开起持续 >= 防抖时间（1.6s >= 1.5s）后触发断开
+        precondition(state.update(activeSessions: [], cmProcessActive: false, now: t0.addingTimeInterval(6.6)) == .disconnected)
         precondition(!state.connected)
         precondition(state.currentPeerIP == nil)
     }
@@ -129,7 +135,9 @@ struct RustDeskTestsRunner {
         precondition(state.connected)
         precondition(state.currentPeerIP == nil)
 
-        precondition(state.update(activeSessions: [], cmProcessActive: false, now: t0.addingTimeInterval(2.0)) == .disconnected)
+        precondition(state.update(activeSessions: [], cmProcessActive: false, now: t0.addingTimeInterval(2.0)) == nil)
+        precondition(state.connected)
+        precondition(state.update(activeSessions: [], cmProcessActive: false, now: t0.addingTimeInterval(3.6)) == .disconnected)
         precondition(!state.connected)
     }
 }

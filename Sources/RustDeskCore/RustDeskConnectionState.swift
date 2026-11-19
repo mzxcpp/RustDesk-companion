@@ -10,7 +10,7 @@ public struct RustDeskConnectionState {
 
     public private(set) var connected = false
     public private(set) var currentPeerIP: String?
-    private var lastSeen = Date.distantPast
+    private var inactiveSince: Date?
     private let debounce: TimeInterval
 
     public init(debounce: TimeInterval = 1.5) {
@@ -26,7 +26,7 @@ public struct RustDeskConnectionState {
         let isActive = !activeSessions.isEmpty || cmProcessActive
 
         if isActive {
-            lastSeen = now
+            inactiveSince = nil
             if !connected {
                 connected = true
                 currentPeerIP = primaryIP
@@ -36,10 +36,15 @@ public struct RustDeskConnectionState {
                 currentPeerIP = ip
                 return .peerChanged
             }
-        } else if connected, now.timeIntervalSince(lastSeen) > debounce {
-            connected = false
-            currentPeerIP = nil
-            return .disconnected
+        } else if connected {
+            let since = inactiveSince ?? now
+            inactiveSince = since
+            if now.timeIntervalSince(since) >= debounce {
+                connected = false
+                currentPeerIP = nil
+                inactiveSince = nil
+                return .disconnected
+            }
         }
         return nil
     }

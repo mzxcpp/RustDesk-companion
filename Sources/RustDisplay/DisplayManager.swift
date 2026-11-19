@@ -49,7 +49,7 @@ final class DisplayManager {
     /// WindowServer 显示配置无响应（事务超时）：停止建屏/删屏/改布局
     private(set) var wedged = false
     static let minLifetime: TimeInterval = 2.5
-    private let cgQueue = DispatchQueue(label: "rustdisplay.display-config")
+    private let cgQueue = DispatchQueue(label: "rustdisplay.display-config", qos: .userInitiated)
     private var reconfigWork: DispatchWorkItem?
     private var reconfigRegistered = false
 
@@ -222,7 +222,12 @@ final class DisplayManager {
         guard let want = recovering ? nil : desired else {
             // 目标=无：恢复物理屏 → 释放虚拟屏 → 还原布局
             if physicalOff {
-                return runCG(settle: 1.0) { PhysicalDisplays.restore(reason: "远程结束") ? .success : .failure }
+                busy = true
+                cgQueue.async {
+                    let ok = PhysicalDisplays.restore(reason: "远程结束")
+                    DispatchQueue.main.async { self.finish(settle: ok ? 0.4 : 1.2) }
+                }
+                return
             }
             if vd != nil || !retiring.isEmpty {
                 guard readyToRelease(retiring + [vd].compactMap { $0 }) else { busy = true; return finish(settle: 0.5) }
@@ -233,7 +238,7 @@ final class DisplayManager {
                 current = nil
                 mainSet = false
                 release(&all)
-                return finish(settle: 1.0)
+                return finish(settle: 0.5)
             }
             if !savedOrigins.isEmpty {
                 let origins = savedOrigins
@@ -263,19 +268,29 @@ final class DisplayManager {
             mainSet = false
             waitOnlineTries = 0
             if !createDisplay(want) { failedCfg = want }
-            return finish(settle: 0.4)
+            return finish(settle: 0.15)
         }
 
         let wantOff = shouldDisablePhysical() && !physicalOverride
-        let wantMain = shouldSetAsMain() || wantOff
+        // 当即将关闭所有物理屏时，虚拟屏成为唯一在线屏会自动置为 (0,0) 主屏，跳过多余的 4 屏原点重排
+        let wantMain = shouldSetAsMain() && !wantOff
 
         if let id = vd?.displayID {
             let online = DisplayManager.onlineDisplays()
             if !online.contains(id) {
                 waitOnlineTries += 1
-                if waitOnlineTries > 20 { Log.info("⚠️ 虚拟屏 5 秒内未上线"); mainSet = true }
+                if waitOnlineTries > 35 { Log.info("⚠️ 虚拟屏 5 秒内未上线"); mainSet = true }
                 busy = true
-                return finish(settle: 0.25)
+                return finish(settle: 0.15)
+            }
+
+            if !wantOff, physicalOff {
+                busy = true
+                cgQueue.async {
+                    let ok = PhysicalDisplays.restore(reason: "手动恢复")
+                    DispatchQueue.main.async { self.finish(settle: ok ? 0.5 : 1.2) }
+                }
+                return
             }
 
             if wantMain && !mainSet {
@@ -285,9 +300,7 @@ final class DisplayManager {
                 }
                 writeMarker()
                 mainSet = true
-                // 若随后要禁用全部物理屏，先给 RustDesk --cm 启动并切到新主屏留出窗口，避免黑屏等待
-                let nextSettle: TimeInterval = wantOff ? 1.8 : 0.5
-                return runCG(settle: nextSettle) {
+                return runCG(settle: 0.5) {
                     let err = applyDisplayConfig { cfg in
                         let t = CGDisplayBounds(id).origin
                         for d in online {
@@ -298,8 +311,8 @@ final class DisplayManager {
                     Log.info(err == .success ? "✅ 虚拟屏已设为主屏" : "⚠️ 设主屏失败 CGError=\(err.rawValue)")
                     return err
                 }
-            } else if !wantMain && mainSet && !physicalOff && !savedOrigins.isEmpty {
-                // 用户从「主屏模式」切回「纯扩展屏模式」：还原物理屏为主屏
+            } else if !wantMain && !physicalOff && !savedOrigins.isEmpty {
+                // 用户切回「纯扩展屏模式」或中途恢复物理屏：还原物理屏为主屏
                 let origins = savedOrigins
                 savedOrigins = [:]
                 mainSet = false
@@ -327,15 +340,12 @@ final class DisplayManager {
                     added = true
                 }
                 if added { writeMarker() }
-                return runCG(settle: 2.0) {
+                return runCG(settle: 1.0) {
                     let err = PhysicalDisplays.disable(toDisable)
                     Log.info(err == .success ? "✅ 已关闭物理屏 \(toDisable)，只保留虚拟屏 #\(id)" : "⚠️ 关闭物理屏失败 CGError=\(err.rawValue)")
                     return err
                 }
             }
-        }
-        if !wantOff, physicalOff {
-            return runCG(settle: 2.5) { PhysicalDisplays.restore(reason: "手动恢复") ? .success : .failure }
         }
     }
 
@@ -404,6 +414,14 @@ final class DisplayManager {
         let online = Set(onlineDisplays())
         let targets = origins.filter { online.contains($0.key) }
         guard !targets.isEmpty else { return .success }
+        let dirty = targets.filter { id, want in
+            let cur = CGDisplayBounds(id).origin
+            return abs(cur.x - want.x) > 1 || abs(cur.y - want.y) > 1
+        }
+        if dirty.isEmpty {
+            Log.info("✅ 显示器布局已就位，无需额外重排")
+            return .success
+        }
         let err = applyDisplayConfig { cfg in
             for (id, o) in targets { CGConfigureDisplayOrigin(cfg, id, Int32(o.x), Int32(o.y)) }
         }
