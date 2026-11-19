@@ -1,4 +1,4 @@
-// swift-tools-version: 6.2
+// swift-tools-version: 5.9
 // 内置副本：只保留 TourKit library（上游另有 TourKitSampleApp、TourKitTests），见 VENDORED.md
 
 import PackageDescription

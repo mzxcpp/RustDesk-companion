@@ -1,4 +1,4 @@
-// swift-tools-version: 6.1
+// swift-tools-version: 5.9
 // 源自 https://github.com/jaywcjlove/PermissionFlow v2.11.3（MIT），仅保留 PermissionFlow 与 SystemSettingsKit
 import PackageDescription
 
