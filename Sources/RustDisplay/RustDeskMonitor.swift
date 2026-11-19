@@ -187,7 +187,7 @@ final class RustDeskMonitor {
 
     private var timer: Timer?
     private var disconnectCheckWork: DispatchWorkItem?
-    private var state = RustDeskConnectionState(debounce: 2.5)
+    private var state = RustDeskConnectionState(debounce: 0.8)
     private let queue = DispatchQueue(label: "rustdisplay.monitor", qos: .utility)
     private var pollInFlight = false
     private var pendingRescan = false
@@ -401,13 +401,13 @@ final class RustDeskMonitor {
             disconnectCheckWork?.cancel()
             disconnectCheckWork = nil
         } else if connected, disconnectCheckWork == nil {
-            // 断开后在防抖阈值（2.5s）刚过时精准触发一次校验，无需等到下一个 2s 周期
+            // 断开后在防抖阈值（0.8s）刚过时精准触发一次校验，无需等到下一个 2s 周期
             let work = DispatchWorkItem { [weak self] in
                 self?.disconnectCheckWork = nil
                 self?.tick()
             }
             disconnectCheckWork = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.6, execute: work)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.9, execute: work)
         }
 
         switch state.update(activeSessions: sessions, cmProcessActive: cmActive, now: Date()) {

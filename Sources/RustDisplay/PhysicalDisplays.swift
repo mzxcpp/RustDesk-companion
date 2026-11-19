@@ -44,18 +44,41 @@ enum PhysicalDisplays {
         return applyDisplayConfig { cfg in ids.forEach { _ = setEnabled(cfg, $0, false) } }
     }
 
-    /// 按记录重新启用物理屏；成功后删除记录。可在任意进程调用，重复调用无害
+    /// 按记录逐块重新启用物理屏（内置屏优先）；全部成功后删除记录。可在任意进程调用，重复调用无害
     @discardableResult
     static func restore(reason: String) -> Bool {
         guard let ids = pending else { return true }
         guard let setEnabled else { return false }
-        let err = applyDisplayConfig { cfg in ids.forEach { _ = setEnabled(cfg, $0, true) } }
-        if err == .success {
+        let ordered = ids.sorted { a, b in
+            let aBuiltin = CGDisplayIsBuiltin(a) != 0
+            let bBuiltin = CGDisplayIsBuiltin(b) != 0
+            if aBuiltin != bBuiltin { return aBuiltin }
+            return a < b
+        }
+        var restored: [CGDirectDisplayID] = []
+        var remaining: [CGDirectDisplayID] = []
+        var lastErr: CGError = .success
+        for id in ordered {
+            // 逐块提交配置事务，避免多块高刷/外接屏同时启用触发 WindowServer 10s 超时（CGError=1014）
+            let err = applyDisplayConfig { cfg in _ = setEnabled(cfg, id, true) }
+            if err == .success {
+                restored.append(id)
+            } else {
+                remaining.append(id)
+                lastErr = err
+            }
+        }
+        if remaining.isEmpty {
             try? FileManager.default.removeItem(at: markerURL)
-            Log.info("✅ 已恢复物理屏 \(ids)（\(reason)）")
+            Log.info("✅ 已恢复物理屏 \(restored)（\(reason)）")
             return true
         }
-        Log.info("⚠️ 恢复物理屏失败 CGError=\(err.rawValue)（\(reason)），稍后重试")
+        try? JSONEncoder().encode(remaining).write(to: markerURL, options: .atomic)
+        if !restored.isEmpty {
+            Log.info("✅ 已先恢复物理屏 \(restored)，剩余 \(remaining) 失败 CGError=\(lastErr.rawValue)（\(reason)），稍后重试")
+        } else {
+            Log.info("⚠️ 恢复物理屏失败 CGError=\(lastErr.rawValue)（\(reason)），稍后重试")
+        }
         return false
     }
 }

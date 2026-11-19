@@ -222,7 +222,7 @@ final class DisplayManager {
         guard let want = recovering ? nil : desired else {
             // 目标=无：恢复物理屏 → 释放虚拟屏 → 还原布局
             if physicalOff {
-                return runCG(settle: 2.5) { PhysicalDisplays.restore(reason: "远程结束") ? .success : .failure }
+                return runCG(settle: 1.0) { PhysicalDisplays.restore(reason: "远程结束") ? .success : .failure }
             }
             if vd != nil || !retiring.isEmpty {
                 guard readyToRelease(retiring + [vd].compactMap { $0 }) else { busy = true; return finish(settle: 0.5) }
@@ -233,7 +233,7 @@ final class DisplayManager {
                 current = nil
                 mainSet = false
                 release(&all)
-                return finish(settle: 1.5)
+                return finish(settle: 1.0)
             }
             if !savedOrigins.isEmpty {
                 let origins = savedOrigins
@@ -263,7 +263,7 @@ final class DisplayManager {
             mainSet = false
             waitOnlineTries = 0
             if !createDisplay(want) { failedCfg = want }
-            return finish(settle: 1.0)
+            return finish(settle: 0.4)
         }
 
         let wantOff = shouldDisablePhysical() && !physicalOverride
@@ -285,7 +285,9 @@ final class DisplayManager {
                 }
                 writeMarker()
                 mainSet = true
-                return runCG(settle: 0.5) {
+                // 若随后要禁用全部物理屏，先给 RustDesk --cm 启动并切到新主屏留出窗口，避免黑屏等待
+                let nextSettle: TimeInterval = wantOff ? 1.8 : 0.5
+                return runCG(settle: nextSettle) {
                     let err = applyDisplayConfig { cfg in
                         let t = CGDisplayBounds(id).origin
                         for d in online {
