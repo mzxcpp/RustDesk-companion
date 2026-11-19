@@ -33,20 +33,15 @@ enum PhysicalDisplays {
         return ids
     }
 
-    /// 先记账再禁用。须在后台队列调用；可选同时将虚拟屏原点归零为主屏
-    static func disable(_ ids: [CGDirectDisplayID], mainDisplayID: CGDirectDisplayID? = nil) -> CGError {
+    /// 先记账再禁用。须在后台队列调用
+    static func disable(_ ids: [CGDirectDisplayID]) -> CGError {
         guard let setEnabled, !ids.isEmpty else { return .failure }
         let merged = Array(Set((pending ?? []) + ids))
         guard (try? JSONEncoder().encode(merged).write(to: markerURL, options: .atomic)) != nil else {
             Log.info("❌ 无法写入物理屏记录，放弃禁用")
             return .failure
         }
-        return applyDisplayConfig { cfg in
-            if let mainID = mainDisplayID {
-                CGConfigureDisplayOrigin(cfg, mainID, 0, 0)
-            }
-            ids.forEach { _ = setEnabled(cfg, $0, false) }
-        }
+        return applyDisplayConfig { cfg in ids.forEach { _ = setEnabled(cfg, $0, false) } }
     }
 
     /// 按记录重新启用物理屏；成功后删除记录。可在任意进程调用，重复调用无害
