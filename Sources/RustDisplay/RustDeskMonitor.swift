@@ -1,11 +1,18 @@
 // 监测 RustDesk 传入远控会话：
-// 1. 增量跟踪 RustDesk server 与主日志（兼容后台服务 --server 模式与直接运行 RustDesk.app 模式）
-// 2. 通过 Darwin libproc + IPC PID 文件与 cm 日志状态零子进程检测会话活跃度
+// 1. 通过 DispatchSource (kqueue) 实时监听 RustDesk 日志目录与文件写入（<10ms 响应，2s 低频兜底）
+// 2. 增量跟踪 RustDesk server 与主日志（兼容 --server 服务模式与桌面 RustDesk.app 模式）
+// 3. 通过 Darwin libproc + IPC PID 文件与 cm 日志缓存零子进程检测会话活跃度
 import Darwin
 import Foundation
 import RustDeskCore
 
 enum RustDeskProbe {
+    private static let cmCacheLock = NSLock()
+    private static var lastCMPath: String?
+    private static var lastCMMTime: Date?
+    private static var lastCMSize: UInt64?
+    private static var lastCMActive = true
+
     static var candidateServerLogPaths: [URL] {
         let home = FileManager.default.homeDirectoryForCurrentUser
         return [
@@ -56,13 +63,33 @@ enum RustDeskProbe {
         return nil
     }
 
-    /// 检查 Connection Manager (`--cm`) 是否存在且正在处理远控会话
+    /// 检查 Connection Manager (`--cm`) 是否存在且正在处理远控会话（对 cm 日志元信息做缓存避免重复读盘）
     static func isCMProcessRunning() -> Bool {
         guard cmPID() != nil else { return false }
-        if let url = cmLogURL, let text = try? String(contentsOf: url, encoding: .utf8) {
-            return RustDeskLogParser.hasActiveCMTask(in: text)
+        guard let url = cmLogURL else { return true }
+        let path = url.path
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path) else { return true }
+        let mtime = attrs[.modificationDate] as? Date
+        let size = (attrs[.size] as? NSNumber)?.uint64Value
+
+        cmCacheLock.lock()
+        if lastCMPath == path, lastCMMTime == mtime, lastCMSize == size {
+            let cached = lastCMActive
+            cmCacheLock.unlock()
+            return cached
         }
-        return true
+        cmCacheLock.unlock()
+
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return true }
+        let active = RustDeskLogParser.hasActiveCMTask(in: text)
+
+        cmCacheLock.lock()
+        lastCMPath = path
+        lastCMMTime = mtime
+        lastCMSize = size
+        lastCMActive = active
+        cmCacheLock.unlock()
+        return active
     }
 
     /// 检查 RustDesk 宿主机端进程是否在运行（兼容 LaunchAgent 服务模式与桌面 App 直连模式）
@@ -159,9 +186,13 @@ final class RustDeskMonitor {
     private(set) var recentPeerIPs: [String] = []
 
     private var timer: Timer?
-    private var state = RustDeskConnectionState()
+    private var disconnectCheckWork: DispatchWorkItem?
+    private var state = RustDeskConnectionState(debounce: 2.5)
     private let queue = DispatchQueue(label: "rustdisplay.monitor", qos: .utility)
     private var pollInFlight = false
+    private var pendingRescan = false
+    private var lastServerCheckAt = Date.distantPast
+    private var lastServerRunning = false
 
     private struct LogTailer {
         var parser = RustDeskLogParser()
@@ -173,9 +204,10 @@ final class RustDeskMonitor {
     }
 
     private var tailers: [String: LogTailer] = [:]
+    private var watchers: [String: (fd: Int32, source: DispatchSourceFileSystemObject)] = [:]
 
     func start() {
-        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.tick()
         }
         tick()
@@ -184,10 +216,22 @@ final class RustDeskMonitor {
     func stop() {
         timer?.invalidate()
         timer = nil
+        disconnectCheckWork?.cancel()
+        disconnectCheckWork = nil
+        queue.async { [weak self] in
+            guard let self else { return }
+            for entry in self.watchers.values {
+                entry.source.cancel()
+            }
+            self.watchers.removeAll()
+        }
     }
 
     private func tick() {
-        guard !pollInFlight else { return }
+        if pollInFlight {
+            pendingRescan = true
+            return
+        }
         pollInFlight = true
         queue.async { [weak self] in
             guard let self else { return }
@@ -197,6 +241,10 @@ final class RustDeskMonitor {
                 self.pollInFlight = false
                 self.recentPeerIPs = snapshot.recentIPs
                 self.apply(sessions: snapshot.sessions, cmActive: snapshot.cmActive)
+                if self.pendingRescan {
+                    self.pendingRescan = false
+                    self.tick()
+                }
             }
         }
     }
@@ -210,6 +258,8 @@ final class RustDeskMonitor {
     private func pollSnapshot() -> Snapshot {
         let cmActive = RustDeskProbe.isCMProcessRunning()
         let urls = RustDeskProbe.existingServerLogURLs
+        syncWatchers(for: urls)
+
         let validPaths = Set(urls.map(\.path))
         tailers = tailers.filter { validPaths.contains($0.key) }
 
@@ -221,11 +271,18 @@ final class RustDeskMonitor {
             .flatMap { $0.parser.activeSessions }
             .sorted { $0.openedAt < $1.openedAt }
 
-        if !mergedSessions.isEmpty && !cmActive && !RustDeskProbe.isServerProcessRunning() {
-            for key in tailers.keys {
-                tailers[key]?.parser.resetActive()
+        if !mergedSessions.isEmpty && !cmActive {
+            let now = Date()
+            if !lastServerRunning || now.timeIntervalSince(lastServerCheckAt) >= 5.0 {
+                lastServerCheckAt = now
+                lastServerRunning = RustDeskProbe.isServerProcessRunning()
             }
-            mergedSessions.removeAll()
+            if !lastServerRunning {
+                for key in tailers.keys {
+                    tailers[key]?.parser.resetActive()
+                }
+                mergedSessions.removeAll()
+            }
         }
 
         var seenIPs = Set<String>()
@@ -241,6 +298,47 @@ final class RustDeskMonitor {
             cmActive: cmActive,
             recentIPs: mergedIPs
         )
+    }
+
+    private func syncWatchers(for urls: [URL]) {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        var watchPaths = [
+            home.appendingPathComponent("Library/Logs/RustDesk").path,
+            home.appendingPathComponent("Library/Logs/RustDesk/server").path,
+        ]
+        watchPaths.append(contentsOf: urls.map(\.path))
+
+        let existingWanted = Set(watchPaths.filter { FileManager.default.fileExists(atPath: $0) })
+        for (path, entry) in watchers where !existingWanted.contains(path) {
+            entry.source.cancel()
+            watchers.removeValue(forKey: path)
+        }
+
+        for path in existingWanted where watchers[path] == nil {
+            let fd = open(path, O_EVTONLY)
+            guard fd >= 0 else { continue }
+            let src = DispatchSource.makeFileSystemObjectSource(
+                fileDescriptor: fd,
+                eventMask: [.write, .extend, .rename, .delete],
+                queue: queue
+            )
+            src.setEventHandler { [weak self, weak src] in
+                guard let self, let src else { return }
+                let events = src.data
+                if events.contains(.rename) || events.contains(.delete) {
+                    src.cancel()
+                    self.watchers.removeValue(forKey: path)
+                }
+                DispatchQueue.main.async { [weak self] in
+                    self?.tick()
+                }
+            }
+            src.setCancelHandler {
+                close(fd)
+            }
+            watchers[path] = (fd, src)
+            src.resume()
+        }
     }
 
     private func tail(url: URL, cmActive: Bool) {
@@ -298,6 +396,20 @@ final class RustDeskMonitor {
     }
 
     private func apply(sessions: [RustDeskSession], cmActive: Bool) {
+        let isActive = !sessions.isEmpty || cmActive
+        if isActive {
+            disconnectCheckWork?.cancel()
+            disconnectCheckWork = nil
+        } else if connected, disconnectCheckWork == nil {
+            // 断开后在防抖阈值（2.5s）刚过时精准触发一次校验，无需等到下一个 2s 周期
+            let work = DispatchWorkItem { [weak self] in
+                self?.disconnectCheckWork = nil
+                self?.tick()
+            }
+            disconnectCheckWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.6, execute: work)
+        }
+
         switch state.update(activeSessions: sessions, cmProcessActive: cmActive, now: Date()) {
         case .connected:
             connected = true
@@ -309,6 +421,8 @@ final class RustDeskMonitor {
             Log.info("检测到 RustDesk 控制端变化（来源：\(currentPeerIP ?? "未知")）")
             onPeerChanged?(currentPeerIP)
         case .disconnected:
+            disconnectCheckWork?.cancel()
+            disconnectCheckWork = nil
             connected = false
             currentPeerIP = nil
             Log.info("检测到 RustDesk 断开")

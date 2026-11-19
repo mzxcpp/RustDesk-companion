@@ -4,8 +4,10 @@
 //   - 虚拟屏释放前必须已上线且存活 ≥ 2.5 秒（否则可能让 WindowServer 显示配置卡死）
 //   - GUI 主线程不能调 CGCompleteDisplayConfiguration（统一放 cgQueue）
 //   - 物理屏是否被禁用以磁盘记录为准（看门狗可能在别的进程里已恢复）
-// 针对 RustDesk 的扩展：
+// 针对 RustDesk 的扩展与优化：
 //   - 支持「扩展屏模式」（shouldSetAsMain = false）与「设为主屏模式」（shouldSetAsMain = true）
+//   - 监听 CGDisplayRegisterReconfigurationCallback，物理屏延迟唤醒上线时自动补关避免漏屏
+//   - 只保留虚拟屏模式合并「设主屏 + 关物理屏」为单次显示事务，并保证 HiDPI 逻辑分辨率为偶数（像素为 4 的倍数）
 import CGVirtualDisplayBridge
 import CoreGraphics
 import Foundation
@@ -17,7 +19,7 @@ final class DisplayManager {
     private var desired: DisplayProfile?
     private var shutdownCompletion: (() -> Void)?
     /// 是否将虚拟屏设为主屏（关闭时仅作为扩展屏附加，不移动菜单栏和 Dock）
-    var shouldSetAsMain: () -> Bool = { true }
+    var shouldSetAsMain: () -> Bool = { false }
     /// 是否应禁用物理屏（由 Coordinator 按设置决定）
     var shouldDisablePhysical: () -> Bool = { false }
     /// 用户手动恢复后，本次连接内不再禁用
@@ -47,8 +49,31 @@ final class DisplayManager {
     private(set) var wedged = false
     static let minLifetime: TimeInterval = 2.5
     private let cgQueue = DispatchQueue(label: "rustdisplay.display-config")
+    private let vdQueue = DispatchQueue(label: "rustdisplay.virtual-display", qos: .userInteractive)
+    private var reconfigWork: DispatchWorkItem?
+    private var reconfigRegistered = false
 
     private static let markerURL = ConfigStore.dir.appendingPathComponent("session.json")
+
+    private static let reconfigCallback: CGDisplayReconfigurationCallBack = { _, flags, userInfo in
+        guard !flags.contains(.beginConfigurationFlag), let userInfo else { return }
+        let manager = Unmanaged<DisplayManager>.fromOpaque(userInfo).takeUnretainedValue()
+        DispatchQueue.main.async {
+            manager.handleSystemDisplayReconfigured()
+        }
+    }
+
+    init() {
+        let err = CGDisplayRegisterReconfigurationCallback(Self.reconfigCallback, Unmanaged.passUnretained(self).toOpaque())
+        reconfigRegistered = (err == .success)
+    }
+
+    deinit {
+        reconfigWork?.cancel()
+        if reconfigRegistered {
+            CGDisplayRemoveReconfigurationCallback(Self.reconfigCallback, Unmanaged.passUnretained(self).toOpaque())
+        }
+    }
 
     var isActive: Bool { vd != nil }
     var physicalOff: Bool { PhysicalDisplays.pending != nil }
@@ -108,6 +133,24 @@ final class DisplayManager {
             recovering = true
         }
         kick()
+    }
+
+    // MARK: - 系统显示器热插拔 / 延迟上线检测
+
+    private func handleSystemDisplayReconfigured() {
+        reconfigWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            guard !self.busy, !self.wedged, self.desired != nil,
+                  self.shouldDisablePhysical(), !self.physicalOverride else { return }
+            let stray = DisplayManager.onlineDisplays().filter { !DisplayManager.isVirtual($0) }
+            if !stray.isEmpty {
+                Log.info("检测到物理屏延迟上线 \(stray)，补做关闭")
+                self.kick()
+            }
+        }
+        reconfigWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
     }
 
     // MARK: - 执行器
@@ -217,7 +260,7 @@ final class DisplayManager {
             mainSet = false
             waitOnlineTries = 0
             if !createDisplay(want) { failedCfg = want }
-            return finish(settle: 1.0)
+            return finish(settle: 0.25)
         }
 
         let wantOff = shouldDisablePhysical() && !physicalOverride
@@ -227,36 +270,61 @@ final class DisplayManager {
             let online = DisplayManager.onlineDisplays()
             if !online.contains(id) {
                 waitOnlineTries += 1
-                if waitOnlineTries > 20 { Log.info("⚠️ 虚拟屏 5 秒内未上线"); mainSet = true }
+                if waitOnlineTries > 25 { Log.info("⚠️ 虚拟屏 5 秒内未上线"); mainSet = true }
                 busy = true
-                return finish(settle: 0.25)
+                return finish(settle: 0.2)
             }
 
-            if wantMain && !mainSet {
-                if savedOrigins.isEmpty {
-                    savedOrigins = Dictionary(uniqueKeysWithValues: online.filter { !DisplayManager.isVirtual($0) }
-                        .map { ($0, CGDisplayBounds($0).origin) })
-                }
-                writeMarker()
-                mainSet = true
-                return runCG(settle: 0.5) {
-                    let err = applyDisplayConfig { cfg in
-                        let t = CGDisplayBounds(id).origin
-                        for d in online {
-                            let o = CGDisplayBounds(d).origin
-                            CGConfigureDisplayOrigin(cfg, d, Int32(o.x - t.x), Int32(o.y - t.y))
-                        }
+            let onlinePhysical = online.filter { !DisplayManager.isVirtual($0) }
+            var addedOrigin = false
+            for pid in onlinePhysical where savedOrigins[pid] == nil {
+                savedOrigins[pid] = CGDisplayBounds(pid).origin
+                addedOrigin = true
+            }
+            if addedOrigin { writeMarker() }
+
+            if !retiring.isEmpty {
+                guard readyToRelease(retiring) else { busy = true; return finish(settle: 0.5) }
+                busy = true
+                release(&retiring)
+                return finish(settle: 1.5)
+            }
+
+            if wantOff {
+                // 不再仅以 !physicalOff 判断：防止外接显示器延迟唤醒时被遗漏
+                if !onlinePhysical.isEmpty {
+                    mainSet = true
+                    return runCG(settle: 1.0) {
+                        let err = PhysicalDisplays.disable(onlinePhysical, mainDisplayID: id)
+                        Log.info(err == .success ? "✅ 已关闭物理屏 \(onlinePhysical)，只保留虚拟屏 #\(id)" : "⚠️ 关闭物理屏失败 CGError=\(err.rawValue)")
+                        return err
                     }
-                    Log.info(err == .success ? "✅ 虚拟屏已设为主屏" : "⚠️ 设主屏失败 CGError=\(err.rawValue)")
-                    return err
                 }
-            } else if !wantMain && mainSet && !physicalOff && !savedOrigins.isEmpty {
-                // 用户从「主屏模式」切回「纯扩展屏模式」：还原物理屏为主屏
-                let origins = savedOrigins
-                savedOrigins = [:]
-                mainSet = false
-                try? FileManager.default.removeItem(at: DisplayManager.markerURL)
-                return runCG(settle: 0.5) { DisplayManager.restoreOrigins(origins) }
+            } else {
+                if physicalOff {
+                    return runCG(settle: 1.5) { PhysicalDisplays.restore(reason: "手动恢复") ? .success : .failure }
+                }
+                if wantMain && !mainSet {
+                    mainSet = true
+                    return runCG(settle: 0.5) {
+                        let err = applyDisplayConfig { cfg in
+                            let t = CGDisplayBounds(id).origin
+                            for d in online {
+                                let o = CGDisplayBounds(d).origin
+                                CGConfigureDisplayOrigin(cfg, d, Int32(o.x - t.x), Int32(o.y - t.y))
+                            }
+                        }
+                        Log.info(err == .success ? "✅ 虚拟屏已设为主屏" : "⚠️ 设主屏失败 CGError=\(err.rawValue)")
+                        return err
+                    }
+                } else if !wantMain && mainSet && !savedOrigins.isEmpty {
+                    // 用户从「主屏模式」切回「纯扩展屏模式」：还原物理屏为主屏
+                    let origins = savedOrigins
+                    savedOrigins = [:]
+                    mainSet = false
+                    try? FileManager.default.removeItem(at: DisplayManager.markerURL)
+                    return runCG(settle: 0.5) { DisplayManager.restoreOrigins(origins) }
+                }
             }
         }
 
@@ -266,31 +334,38 @@ final class DisplayManager {
             release(&retiring)
             return finish(settle: 1.5)
         }
-
-        if wantOff, !physicalOff, let id = vd?.displayID {
-            let physical = DisplayManager.onlineDisplays().filter { !DisplayManager.isVirtual($0) }
-            if !physical.isEmpty {
-                return runCG(settle: 1.5) {
-                    let err = PhysicalDisplays.disable(physical)
-                    Log.info(err == .success ? "✅ 已关闭物理屏 \(physical)，只保留虚拟屏 #\(id)" : "⚠️ 关闭物理屏失败 CGError=\(err.rawValue)")
-                    return err
-                }
-            }
-        }
-        if !wantOff, physicalOff {
-            return runCG(settle: 1.5) { PhysicalDisplays.restore(reason: "手动恢复") ? .success : .failure }
-        }
     }
 
     // MARK: - 单步操作
 
     private func createDisplay(_ cfg: DisplayProfile) -> Bool {
-        let w = cfg.width, h = cfg.height
+        // HiDPI 下将逻辑宽高对齐为偶数，确保原生像素宽高均为 4 的倍数，避免硬件编码器/缩放出错
+        let mw: Int
+        let mh: Int
+        let pixelW: Int
+        let pixelH: Int
+        if cfg.hiDPI {
+            mw = max(160, ((cfg.width + 1) / 2) & ~1)
+            mh = max(160, ((cfg.height + 1) / 2) & ~1)
+            pixelW = mw * 2
+            pixelH = mh * 2
+        } else {
+            mw = max(320, cfg.width & ~1)
+            mh = max(320, cfg.height & ~1)
+            pixelW = mw
+            pixelH = mh
+        }
+
         let desc = CGVirtualDisplayDescriptor()
         desc.name = "RustDesk Companion · \(cfg.label)"
-        desc.maxPixelsWide = UInt32(w)
-        desc.maxPixelsHigh = UInt32(h)
-        desc.sizeInMillimeters = CGSize(width: Double(w) / 220 * 25.4, height: Double(h) / 220 * 25.4)
+        desc.maxPixelsWide = UInt32(pixelW)
+        desc.maxPixelsHigh = UInt32(pixelH)
+        desc.sizeInMillimeters = CGSize(width: Double(pixelW) / 220 * 25.4, height: Double(pixelH) / 220 * 25.4)
+        desc.queue = vdQueue
+        desc.redPrimary = CGPoint(x: 0.6400, y: 0.3300)
+        desc.greenPrimary = CGPoint(x: 0.3000, y: 0.6000)
+        desc.bluePrimary = CGPoint(x: 0.1500, y: 0.0600)
+        desc.whitePoint = CGPoint(x: 0.3127, y: 0.3290)
         desc.vendorID = DisplayManager.vendorID
         desc.productID = 0x0001
         // 每次随机序列号：与残留虚拟屏同序列号时 CGVirtualDisplay 会返回 nil
@@ -303,7 +378,6 @@ final class DisplayManager {
         }
         let settings = CGVirtualDisplaySettings()
         settings.hiDPI = cfg.hiDPI
-        let mw = cfg.hiDPI ? w / 2 : w, mh = cfg.hiDPI ? h / 2 : h
         if let mode = CGVirtualDisplayMode(width: UInt(mw), height: UInt(mh), refreshRate: 60) {
             settings.modes = [mode]
         }
@@ -316,7 +390,8 @@ final class DisplayManager {
         vd = display
         current = cfg
         bornAt[display.displayID] = Date()
-        Log.info("✅ 已创建虚拟屏 #\(display.displayID) \(cfg.label) \(cfg.sizeLabel)")
+        let actualLabel = "\(pixelW)×\(pixelH)\(cfg.hiDPI ? " 高清" : "")"
+        Log.info("✅ 已创建虚拟屏 #\(display.displayID) \(cfg.label) \(actualLabel)")
         return true
     }
 

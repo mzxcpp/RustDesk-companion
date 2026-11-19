@@ -61,8 +61,6 @@ final class SettingsModel: ObservableObject {
         if running != watchdogRunning { watchdogRunning = running }
         let off = PhysicalDisplays.pending != nil
         if off != physicalOff { physicalOff = off }
-        let login = SMAppService.mainApp.status == .enabled
-        if login != launchAtLogin { launchAtLogin = login }
         if let manual = isManualActive?(), manual != manualActive { manualActive = manual }
         let auto = !store.config.paused
         if auto != autoVirtual { autoVirtual = auto }

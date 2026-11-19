@@ -28,7 +28,7 @@ struct ResolutionPreset: Identifiable, Hashable {
         .init(id: "1920x1080", title: "1080p", width: 1920, height: 1080, hiDPI: false),
         .init(id: "2360x1640", title: "iPad Air 11\"", width: 2360, height: 1640, hiDPI: true),
         .init(id: "2752x2064", title: "iPad Pro 13\"", width: 2752, height: 2064, hiDPI: true),
-        .init(id: "2556x1179", title: "iPhone", width: 2556, height: 1179, hiDPI: true),
+        .init(id: "2556x1180", title: "iPhone", width: 2556, height: 1180, hiDPI: true),
     ]
 }
 
