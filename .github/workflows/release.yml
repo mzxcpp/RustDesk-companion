@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run RustDeskCore tests
+        run: swift run rustdesk-tests
+
+      - name: Build and sign RustDesk Companion.app
+        env:
+          SIGN_IDENTITY: '-'
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ -z "$VERSION" || "$GITHUB_REF_NAME" != v* ]]; then
+            VERSION="1.0.0"
+          fi
+          VERSION="$VERSION" scripts/build-app.sh
+          mkdir -p dist
+          ditto -c -k --keepParent "build/RustDesk Companion.app" "dist/RustDesk-Companion-${VERSION}-macOS-arm64.zip"
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/RustDesk-Companion-*.zip
+          body: |
+            ## RustDesk 伴侣（RustDesk Companion）${{ github.ref_name }}
+
+            > **项目来源与贡献声明**：本软件基于并派生自 **[aoyamashou/UUyc-companion（UU远程伴侣）](https://github.com/aoyamashou/UUyc-companion)**（MIT 协议）。核心 `CGVirtualDisplay` 虚拟屏管理、WindowServer 防崩溃收敛状态机、物理屏软关闭、`⌃⌥⌘9` 快捷键与守护进程兜底机制、界面框架及图标素材均来自原项目。本仓库（`mzxcpp/RustDesk-companion`）的贡献仅限于将远控检测与配置逻辑从网易 UU 远程迁移适配至 **RustDesk（macOS）**。
+
+            ### 本版本变更（RustDesk 适配）
+            - **免辅助功能权限检测**：通过增量监听 RustDesk 本地连接日志（同时兼容 `--server` 服务模式与普通桌面 `RustDesk.app` 直连模式）及 Darwin `libproc` 进程检测自动识别远控连入与断开。
+            - **默认纯扩展虚拟屏**：连入时默认在旁侧拓展一块 `2560×1600` 高清（HiDPI）虚拟屏，不抢占本机主屏和 Dock；可在菜单栏或设置中一键切换「将虚拟屏设为主屏」或「远程时只保留虚拟屏」。
+            - **常用预设与按来源 IP 规则**：内置常见平板/显示器分辨率预设，支持从日志读取近期连入来源 IP 并定制独立规则。
+
+            ### 安装提示（未公证签名）
+            本压缩包采用 ad-hoc 签名，首次解压拖入「应用程序」后若遇到 macOS 拦截提示，请在「系统设置 › 隐私与安全性」点击「仍要打开」，或在终端执行：
+            ```bash
+            xattr -dr com.apple.quarantine "/Applications/RustDesk Companion.app"
+            ```

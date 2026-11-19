@@ -1,0 +1,9 @@
+.build/
+.swiftpm/
+*.app
+*.zip
+.DS_Store
+**/.DS_Store
+build/
+dist/
+UUyc-companion/
